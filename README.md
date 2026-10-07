@@ -162,13 +162,3 @@ Results for SET:
   Latency p95:     34.7 us
   Latency p99:     41.7 us
 ```
-
----
-
-## Resume-Ready Bullets
-
-- **Built a Redis-compatible in-memory key-value datastore in C++20** using Linux edge-triggered `epoll` and non-blocking TCP, supporting high-concurrency client workloads without one thread per connection.
-- **Implemented a custom dual-table hash map with bounded incremental rehashing**, eliminating $O(N)$ full-table stop-the-world latency spikes during keyspace growth.
-- **Engineered skip-list-backed sorted sets** with secondary hash indexing, TTL expiration (passive & active), and approximate LRU/LFU memory eviction under configurable memory limits.
-- **Designed Append-Only File (AOF) persistence** with configurable fsync modes, automated crash recovery, and non-blocking background rewriting using copy-on-write (`fork()` on Linux).
-- **Benchmarked sustained throughput of 200,000+ ops/sec** with sub-50μs p99 latency, and authored deterministic unit, integration, protocol-fuzzing, and fault-injection test suites.
