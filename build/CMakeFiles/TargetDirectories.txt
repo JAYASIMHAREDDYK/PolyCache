@@ -1,0 +1,7 @@
+U:/Personal Projects/PolyCache/build/CMakeFiles/polycache_core.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/polycache-server.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/test_server.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/test_runner.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/test.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/edit_cache.dir
+U:/Personal Projects/PolyCache/build/CMakeFiles/rebuild_cache.dir

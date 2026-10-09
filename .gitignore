@@ -1,9 +1,0 @@
-build/
-*.exe
-*.o
-*.obj
-*.a
-*.aof
-temp-rewrite.aof
-.vscode/
-.idea/

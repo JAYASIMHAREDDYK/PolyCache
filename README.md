@@ -1,174 +1,62 @@
-# PolyCache (MiniRedis)
+# PolyCache
 
-High-performance, asynchronous, in-memory networked key-value datastore implemented in C++20. PolyCache speaks a production subset of the Redis RESP2 protocol and features non-blocking I/O, custom hash tables with incremental rehashing, skip-list-backed sorted sets, approximate LRU/LFU eviction, and durable Append-Only File (AOF) persistence with background copy-on-write rewriting.
+Fixed-capacity key-value cache in C++17 with swappable eviction policies (LRU, LFU, FIFO). Built as a single-file implementation to work through the Strategy pattern applied to a real data structure problem — specifically, how to make eviction logic interchangeable without the cache knowing which policy it's using, and how each policy's data structure choice follows from its O(1) constraint.
 
----
-
-## Key Highlights & Performance
-
-- **Extreme Throughput**: **200,000+ operations/sec** sustained on commodity hardware.
-- **Microsecond Latency**: **p50 < 20 μs**, **p95 < 40 μs**, **p99 < 50 μs**.
-- **Lock-Free Single-Threaded Core**: High-concurrency event loop based on Linux edge-triggered `epoll` (with cross-platform `WSAPoll` abstraction for Windows).
-- **No Stop-the-World Rehashing**: Custom hash table spreads bucket migration across operations to eliminate tail latency spikes.
-- **Skip-List Sorted Sets**: $O(\log N)$ score ordering combined with $O(1)$ member lookups.
-- **Bounded Memory & Eviction**: Configurable `maxmemory` limit with approximate LRU and LFU sampling policies.
-- **Crash Recovery & COW Rewriting**: Durable AOF logging with background rewriting leveraging Linux `fork()` and kernel copy-on-write.
-
----
-
-## Repository Structure
+## Build / Run
 
 ```
-polycache/
-├── CMakeLists.txt              # Unified build configuration
-├── README.md                   # Comprehensive documentation
-├── docs/
-│   ├── architecture.md         # Event loop, memory, and engine design
-│   ├── protocol.md             # RESP2 protocol and command reference
-│   ├── persistence.md          # AOF logging, fsync, and COW rewrite
-│   └── benchmarks.md           # Benchmark reports and metrics
-├── src/
-│   ├── net/                    # Non-blocking sockets & epoll event loop
-│   ├── protocol/               # Streaming RESP2 parser & serializer
-│   ├── storage/                # Custom Dict, SkipList, and Store engine
-│   ├── eviction/               # Approximate LRU, LFU, and memory limits
-│   ├── persistence/            # AOF log manager and BGREWRITEAOF
-│   ├── command/                # Command registry and execution
-│   ├── metrics/                # Telemetry and p50/p95/p99 latency tracking
-│   ├── server/                 # Client state machine and connection lifecycle
-│   └── main.cpp                # Server entry point and CLI parsing
-├── tests/
-│   ├── unit/                   # C++ unit tests (Dict, SkipList, RESP, Eviction, AOF)
-│   ├── integration/            # Full command integration test suite
-│   ├── protocol/               # Fragmentation, pipelining, malformed input tests
-│   └── recovery/               # Crash recovery and BGREWRITEAOF tests
-├── benchmarks/
-│   └── benchmark.py            # High-throughput multi-client benchmark tool
-└── scripts/
-    ├── stress_test.py          # Concurrent socket stress tester
-    └── run_all_tests.py        # Automated master test harness
+g++ -std=c++17 -O2 -o cache cache.cpp
+./cache
 ```
 
----
+Single file, no dependencies beyond the standard library.
 
-## Supported Commands
+## Design
 
-| Category | Commands | Description |
-|----------|----------|-------------|
-| **Strings** | `PING`, `SET`, `GET`, `DEL`, `EXISTS` | Basic string storage with optional `EX`/`PX` TTLs |
-| **Counters** | `INCR`, `DECR` | Atomic 64-bit integer counters |
-| **Expiry** | `EXPIRE`, `TTL` | Passive and active background key expiration |
-| **Sorted Sets** | `ZADD`, `ZRANGEBYSCORE`, `ZREM` | Skip-list-backed ranked sets with member index |
-| **Server** | `INFO`, `DBSIZE`, `FLUSHDB` | Telemetry, latency percentiles, and database clear |
-| **Persistence** | `BGREWRITEAOF`, `LASTSAVE` | Background snapshot rewrite and save timestamps |
+### Strategy pattern
 
----
+`Cache` holds a `std::unique_ptr<EvictionPolicy>` and calls `onAccess`, `onInsert`, `evict`, `onRemove` — it never branches on policy type. Policies are injected via a factory function (`createPolicy("LRU")`). Adding a new policy means writing one class; `Cache` doesn't change.
 
-## Build & Run
+### Policy hierarchy
 
-### Prerequisites
-- C++20 compliant compiler (GCC 11+, Clang 13+, or MSVC 2022+)
-- CMake 3.16+
-- Python 3.8+ (for integration tests and benchmarks)
+LRU and FIFO share identical bookkeeping (ordered list + position map), differing only in whether `onAccess` moves the key to the front. This is extracted into `OrderedListPolicy`; `FIFOPolicy` is a one-liner override (`onAccess` does nothing) and `LRUPolicy` adds the move-to-front logic.
 
-### Building PolyCache
+Convention: front = most recently inserted/accessed, back = eviction candidate. Both policies inherit the same `evict()` (pop from back) and `onInsert()` (push to front). This matters because mixing conventions (e.g. FIFO's "push to back" with LRU's "move to front") silently breaks LRU's eviction order without any obvious failure at the unit-test level — it only shows up as degraded hit rates under load.
 
-```bash
-# Generate build configuration
-cmake -B build -G "MinGW Makefiles" # or "Unix Makefiles" on Linux
+### LFU's frequency-bucket trick
 
-# Compile server and unit tests
-cmake --build build
-```
+Naive LFU scans all keys for the minimum frequency — O(n). The O(1) approach: group keys into lists indexed by frequency (`buckets[freq] → list of keys`). Track `minFreq` as the lowest non-empty bucket. Eviction pops from `buckets[minFreq]` in O(1). On access, a key moves from `buckets[f]` to `buckets[f+1]`; if that empties bucket `f` and `f == minFreq`, bump `minFreq`.
 
-### Running the Server
+One subtlety: `minFreq` is only correct because `Cache::put` always calls `onInsert` immediately after `evict`, which resets `minFreq` to 1. Calling `evict()` standalone (e.g. in a test harness) can leave `minFreq` stale. This is a protocol invariant between `Cache` and `LFUPolicy`, not enforced by the type system.
 
-```bash
-# Start server with default settings (port 6379, 64MB memory limit, AOF enabled)
-./build/polycache-server --port 6379 --maxmemory 64mb --policy allkeys-lru
+LFU uses `.at()` instead of `operator[]` for bucket/position lookups — if invariants are broken, it throws `std::out_of_range` instead of silently inserting empty entries.
 
-# Or on Windows using test_server.exe:
-./test_server.exe --port 6379 --maxmemory 128mb --policy allkeys-lru --fsync everysec
-```
+## Benchmark Results
 
-### Server Configuration Flags
+Capacity 50, 10,000 accesses, key range 0–199, fixed seed (42).
 
-- `--port <port>`: Port to bind (default: `6379`).
-- `--host <ip>`: Bind address (default: `0.0.0.0`).
-- `--maxmemory <size>`: Memory limit e.g. `64mb`, `1gb` (default: `64mb`).
-- `--policy <policy>`: Eviction policy (`allkeys-lru`, `allkeys-lfu`, `noeviction`).
-- `--aof <yes|no>`: Enable AOF persistence (default: `yes`).
-- `--fsync <always|everysec|no>`: Fsync policy (default: `everysec`).
-- `--aof-file <file>`: AOF filename (default: `appendonly.aof`).
+| Policy | Sequential | Random | Hot Key (80/20) |
+|--------|-----------|--------|-----------------|
+| LRU    | 0.0%      | 25.8%  | 84.1%           |
+| LFU    | 0.0%      | 23.8%  | 84.2%           |
+| FIFO   | 0.0%      | 25.2%  | 80.5%           |
 
----
+**Sequential**: range (200) exceeds capacity (50) with no repetition within a cycle, so every access is a miss regardless of policy. All three score 0%.
 
-## Testing & Verification
+**Random**: uniform distribution gives no exploitable pattern. All policies perform similarly — there's no "hot" subset to keep in cache.
 
-PolyCache includes an automated master test harness that compiles and validates all unit, integration, protocol edge-case, recovery, and stress tests:
+**Hot Key**: 80% of accesses target 10 keys, 20% target the remaining 190. LRU and LFU both learn to retain the hot set; FIFO can't because it ignores usage. The code asserts `lru_hits >= fifo_hits` and `lfu_hits >= fifo_hits` on this workload as a relational invariant — this is a stronger check than eyeballing absolute numbers, and would have caught the front/back convention bug described above.
 
-```bash
-python scripts/run_all_tests.py
-```
+## Known Limitations
 
-### Individual Test Suites
+- **Not thread-safe.** No locking on `Cache` or any policy internals.
+- **`assert(capacity > 0)` compiles to a no-op under `-DNDEBUG`.** The guard exists but vanishes in release builds that define `NDEBUG`. If this moved to production code, it should be a thrown exception.
+- **`int` keys and values only.** Not templated — sufficient for the exercise but not reusable as a generic cache.
+- **LFU `minFreq` invariant is a protocol, not a type constraint.** See the design section.
 
-```bash
-# 1. C++ Unit Tests (Dict, SkipList, RESP, Eviction, AOF)
-./build/test_runner.exe
+## What I'd add with more time
 
-# 2. Integration Tests (Full RESP2 command verification)
-python tests/integration/test_server_integration.py 6379
-
-# 3. Protocol Edge Cases (Fragmentation, pipelining, malformed packets)
-python tests/protocol/test_protocol_edgecases.py 6379
-
-# 4. Crash Recovery & BGREWRITEAOF
-python tests/recovery/test_recovery.py 6379
-
-# 5. Concurrent Connection Stress
-python scripts/stress_test.py 100 6379
-```
-
----
-
-## Benchmarks
-
-Run the high-performance benchmark suite to measure sustained throughput and tail latencies:
-
-```bash
-# Benchmark SET throughput (10,000 requests, 5 concurrent clients, pipeline batch 16)
-python benchmarks/benchmark.py --port 6379 -n 10000 -c 5 -P 16 -t SET
-
-# Benchmark GET throughput
-python benchmarks/benchmark.py --port 6379 -n 10000 -c 5 -P 16 -t GET
-```
-
-### Sample Measured Results
-
-```
-================================================================
-  PolyCache Benchmark: SET workload
-  Target: 127.0.0.1:6389
-  Clients: 5 concurrent | Pipeline batch: 16
-  Total Requests: 10,000
-================================================================
-
-Results for SET:
-  Throughput:      209,279 ops/sec
-  Elapsed Time:    0.048 seconds
-  Total Requests:  10,000
-  Latency p50:     15.7 us
-  Latency p95:     34.7 us
-  Latency p99:     41.7 us
-```
-
----
-
-## Resume-Ready Bullets
-
-- **Built a Redis-compatible in-memory key-value datastore in C++20** using Linux edge-triggered `epoll` and non-blocking TCP, supporting high-concurrency client workloads without one thread per connection.
-- **Implemented a custom dual-table hash map with bounded incremental rehashing**, eliminating $O(N)$ full-table stop-the-world latency spikes during keyspace growth.
-- **Engineered skip-list-backed sorted sets** with secondary hash indexing, TTL expiration (passive & active), and approximate LRU/LFU memory eviction under configurable memory limits.
-- **Designed Append-Only File (AOF) persistence** with configurable fsync modes, automated crash recovery, and non-blocking background rewriting using copy-on-write (`fork()` on Linux).
-- **Benchmarked sustained throughput of 200,000+ ops/sec** with sub-50μs p99 latency, and authored deterministic unit, integration, protocol-fuzzing, and fault-injection test suites.
+- Template on key/value types
+- Thread-safe wrapper (or a lock-free LRU variant)
+- TTL-based expiration as a fourth policy
+- Larger-scale benchmarks with wall-clock timing, not just hit rates
